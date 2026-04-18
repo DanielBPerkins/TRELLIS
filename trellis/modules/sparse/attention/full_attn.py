@@ -30,6 +30,27 @@ def _sdpa_varlen_qkvpacked(qkv, seq_lens):
     return torch.cat(outs, dim=0)
 
 
+def _sdpa_batched_qkvpacked(qkv_feats, chunk_size: int = 512):
+    """Chunked batched sdpa for fixed-length windows.
+
+    qkv_feats: [B, N, 3, H, D]. Returns [B, N, H, D].
+    Processes B in chunks so we don't materialize all attention maps at
+    once; flash_attn's fused kernel tiles internally but plain sdpa on
+    B=30K+ OOMs the 3090 Ti. chunk_size=512 keeps peak VRAM bounded.
+    """
+    B, N, _, H, D = qkv_feats.shape
+    outs = []
+    for i in range(0, B, chunk_size):
+        chunk = qkv_feats[i:i + chunk_size]                 # [b, N, 3, H, D]
+        q, k, v = chunk.unbind(dim=2)                       # [b, N, H, D]
+        q = q.transpose(1, 2).contiguous()                  # [b, H, N, D]
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+        o = _F.scaled_dot_product_attention(q, k, v)        # [b, H, N, D]
+        outs.append(o.transpose(1, 2).contiguous())         # [b, N, H, D]
+    return torch.cat(outs, dim=0)
+
+
 def _sdpa_varlen_kvpacked(q, kv, q_seq_lens, kv_seq_lens):
     outs = []
     qs, ks = 0, 0
