@@ -7,8 +7,58 @@ if ATTN == 'xformers':
     import xformers.ops as xops
 elif ATTN == 'flash_attn':
     import flash_attn
+elif ATTN == 'sdpa':
+    import torch.nn.functional as _F
 else:
     raise ValueError(f"Unknown attention module: {ATTN}")
+
+
+def _sdpa_varlen_qkvpacked(qkv, seq_lens):
+    """Per-sequence sdpa fallback for packed QKV. qkv is [T, 3, H, D].
+    Returns [T, H, D]. Matches flash_attn_varlen_qkvpacked_func semantics."""
+    outs = []
+    start = 0
+    for sl in seq_lens:
+        sq = qkv[start:start + sl]              # [sl, 3, H, D]
+        q, k, v = sq.unbind(dim=1)               # each [sl, H, D]
+        q = q.unsqueeze(0).transpose(1, 2)       # [1, H, sl, D]
+        k = k.unsqueeze(0).transpose(1, 2)
+        v = v.unsqueeze(0).transpose(1, 2)
+        o = _F.scaled_dot_product_attention(q, k, v)  # [1, H, sl, D]
+        outs.append(o.transpose(1, 2).squeeze(0))     # [sl, H, D]
+        start += sl
+    return torch.cat(outs, dim=0)
+
+
+def _sdpa_varlen_kvpacked(q, kv, q_seq_lens, kv_seq_lens):
+    outs = []
+    qs, ks = 0, 0
+    for q_sl, kv_sl in zip(q_seq_lens, kv_seq_lens):
+        qi = q[qs:qs + q_sl]                             # [q_sl, H, D]
+        kvi = kv[ks:ks + kv_sl]                          # [kv_sl, 2, H, D]
+        ki, vi = kvi.unbind(dim=1)
+        qi = qi.unsqueeze(0).transpose(1, 2)
+        ki = ki.unsqueeze(0).transpose(1, 2)
+        vi = vi.unsqueeze(0).transpose(1, 2)
+        o = _F.scaled_dot_product_attention(qi, ki, vi)
+        outs.append(o.transpose(1, 2).squeeze(0))
+        qs += q_sl
+        ks += kv_sl
+    return torch.cat(outs, dim=0)
+
+
+def _sdpa_varlen(q, k, v, q_seq_lens, kv_seq_lens):
+    outs = []
+    qs, ks = 0, 0
+    for q_sl, kv_sl in zip(q_seq_lens, kv_seq_lens):
+        qi = q[qs:qs + q_sl].unsqueeze(0).transpose(1, 2)
+        ki = k[ks:ks + kv_sl].unsqueeze(0).transpose(1, 2)
+        vi = v[ks:ks + kv_sl].unsqueeze(0).transpose(1, 2)
+        o = _F.scaled_dot_product_attention(qi, ki, vi)
+        outs.append(o.transpose(1, 2).squeeze(0))
+        qs += q_sl
+        ks += kv_sl
+    return torch.cat(outs, dim=0)
 
 
 __all__ = [
@@ -206,6 +256,13 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             out = flash_attn.flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
         elif num_all_args == 3:
             out = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
+    elif ATTN == 'sdpa':
+        if num_all_args == 1:
+            out = _sdpa_varlen_qkvpacked(qkv, q_seqlen)
+        elif num_all_args == 2:
+            out = _sdpa_varlen_kvpacked(q, kv, q_seqlen, kv_seqlen)
+        elif num_all_args == 3:
+            out = _sdpa_varlen(q, k, v, q_seqlen, kv_seqlen)
     else:
         raise ValueError(f"Unknown attention module: {ATTN}")
     

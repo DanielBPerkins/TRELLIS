@@ -9,6 +9,9 @@ if ATTN == 'xformers':
     import xformers.ops as xops
 elif ATTN == 'flash_attn':
     import flash_attn
+elif ATTN == 'sdpa':
+    import torch.nn.functional as _F
+    from .full_attn import _sdpa_varlen_qkvpacked
 else:
     raise ValueError(f"Unknown attention module: {ATTN}")
 
@@ -168,6 +171,12 @@ def sparse_serialized_scaled_dot_product_self_attention(
             out = xops.memory_efficient_attention(q, k, v)          # [B, N, H, C]
         elif ATTN == 'flash_attn':
             out = flash_attn.flash_attn_qkvpacked_func(qkv_feats)   # [B, N, H, C]
+        elif ATTN == 'sdpa':
+            q, k, v = qkv_feats.unbind(dim=2)                       # [B, N, H, C]
+            q = q.transpose(1, 2)                                   # [B, H, N, C]
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            out = _F.scaled_dot_product_attention(q, k, v).transpose(1, 2)  # [B, N, H, C]
         else:
             raise ValueError(f"Unknown attention module: {ATTN}")
         out = out.reshape(B * N, H, C)                              # [M, H, C]
@@ -183,6 +192,8 @@ def sparse_serialized_scaled_dot_product_self_attention(
             cu_seqlens = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(seq_lens), dim=0)], dim=0) \
                         .to(qkv.device).int()
             out = flash_attn.flash_attn_varlen_qkvpacked_func(qkv_feats, cu_seqlens, max(seq_lens)) # [M, H, C]
+        elif ATTN == 'sdpa':
+            out = _sdpa_varlen_qkvpacked(qkv_feats, seq_lens)       # [M, H, C]
 
     out = out[bwd_indices]      # [T, H, C]
 
